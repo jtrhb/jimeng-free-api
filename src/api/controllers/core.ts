@@ -3,7 +3,8 @@ import path from "path";
 import _ from "lodash";
 import mime from "mime";
 import axios, { AxiosRequestConfig, AxiosResponse } from "axios";
-
+import crc32 from 'crc32';
+import * as crypto from "crypto";
 import APIException from "@/lib/exceptions/APIException.ts";
 import EX from "@/api/consts/exceptions.ts";
 import { createParser } from "eventsource-parser";
@@ -146,31 +147,47 @@ export async function request(
 ) {
   const token = await acquireToken(refreshToken);
   const deviceTime = util.unixTimestamp();
+  const url = uri.includes('https://') ? uri : `https://jimeng.jianying.com${uri}`;
   const sign = util.md5(
     `9e2c|${uri.slice(-7)}|${PLATFORM_CODE}|${VERSION_CODE}|${deviceTime}||11ac`
   );
-  const response = await axios.request({
-    method,
-    url: `https://jimeng.jianying.com${uri}`,
-    params: {
-      aid: DEFAULT_ASSISTANT_ID,
-      device_platform: "web",
-      region: "CN",
-      web_id: WEB_ID,
-      ...(options.params || {}),
-    },
-    headers: {
-      ...FAKE_HEADERS,
-      Cookie: generateCookie(token),
-      "Device-Time": deviceTime,
-      Sign: sign,
-      "Sign-Ver": "1",
-      ...(options.headers || {}),
-    },
-    timeout: 15000,
-    validateStatus: () => true,
-    ..._.omit(options, "params", "headers"),
-  });
+  let response
+  if (uri.includes('https://')) {
+    response = await axios.request({
+      method,
+      url,
+      data: method.toUpperCase() !== 'GET' ? options.data : undefined,
+      params: method.toUpperCase() === 'GET' ? { ...options.data, ...options.params } : options.params,
+      headers: {
+        ...FAKE_HEADERS,
+        Cookie: generateCookie(token),
+        ...options.headers,
+      }
+    })
+  } else {
+    response = await axios.request({
+      method,
+      url,
+      params: {
+        aid: DEFAULT_ASSISTANT_ID,
+        device_platform: "web",
+        region: "CN",
+        web_id: WEB_ID,
+        ...(options.params || {}),
+      },
+      headers: {
+        ...FAKE_HEADERS,
+        Cookie: generateCookie(token),
+        "Device-Time": deviceTime,
+        Sign: sign,
+        "Sign-Ver": "1",
+        ...(options.headers || {}),
+      },
+      timeout: 15000,
+      validateStatus: () => true,
+      ..._.omit(options, "params", "headers"),
+    });
+  }
   // 流式响应直接返回response
   if (options.responseType == "stream") return response;
   return checkResult(response);
@@ -210,11 +227,11 @@ export async function checkFileUrl(fileUrl: string) {
  * @param refreshToken 用于刷新access_token的refresh_token
  * @param isVideoImage 是否是用于视频图像
  */
-export async function uploadFile(
+export async function uploadImage(
   fileUrl: string,
   refreshToken: string,
   isVideoImage: boolean = false
-) {
+): Promise<string> {
   // 预检查远程文件URL可用性
   await checkFileUrl(fileUrl);
 
@@ -238,10 +255,110 @@ export async function uploadFile(
     }));
   }
 
-  // 获取文件的MIME类型
-  mimeType = mimeType || mime.getType(filename);
+  try {
+    mimeType = mimeType || mime.getType(filename);
+    const imageCrc32 = crc32(fileData).toString(16);
+    const uploadAuth = await getUploadAuth(refreshToken);
+    const getUploadImageProofRequestParams = {
+      Action: 'ApplyImageUpload',
+      FileSize: fileData.length,
+      ServiceId: 'tb4s082cfz',
+      Version: '2018-08-01',
+      s: util.generateRandomString({
+        length: 10,
+        charset: 'abcdefghijklmnopqrstuvwxyz0123456789'
+      }),
+    };
+    // 获取图片上传请求头
+    const requestHeadersInfo = await generateAuthorizationAndHeader(
+      uploadAuth.access_key_id,
+      uploadAuth.secret_access_key,
+      uploadAuth.session_token,
+      'cn-north-1',
+      'imagex',
+      'GET',
+      getUploadImageProofRequestParams,
+    );
+    // 获取图片上传凭证
+    const uploadImgRes = await request(
+      'GET',
+      'https://imagex.bytedanceapi.com/?' + httpBuildQuery(getUploadImageProofRequestParams),
+      refreshToken,
+      {
+        params: {},
+        data: {},
+        headers: requestHeadersInfo
+      }
+    );
 
-  // 待开发
+    if (uploadImgRes?.['Response  ']?.hasOwnProperty('Error')) {
+      return;
+    }
+
+    const UploadAddress = uploadImgRes.Result.UploadAddress;
+    // 用凭证拼接上传图片接口
+    const uploadImgUrl = `https://${UploadAddress.UploadHosts[0]}/upload/v1/${UploadAddress.StoreInfos[0].StoreUri}`;
+    // 上传图片
+    const imageUploadRes = await uploadFile(
+      uploadImgUrl,
+      fileData,
+      {
+        Authorization: UploadAddress.StoreInfos[0].Auth,
+        'Content-Crc32': imageCrc32,
+        'Content-Type': 'application/octet-stream',
+        // 'X-Storage-U': '3674996648187204',
+      },
+      'POST',
+    );
+    if (imageUploadRes.code !== 2000) {
+      console.log(imageUploadRes.message);
+      return;
+    }
+    const commitImgParams = {
+      Action: 'CommitImageUpload',
+      FileSize: fileData.length,
+      ServiceId: 'tb4s082cfz',
+      Version: '2018-08-01',
+      // user_id: userUid,
+    };
+
+    const commitImgContent = {
+      SessionKey: UploadAddress.SessionKey,
+    };
+
+    const commitImgHead = await generateAuthorizationAndHeader(
+      uploadAuth.access_key_id,
+      uploadAuth.secret_access_key,
+      uploadAuth.session_token,
+      'cn-north-1',
+      'imagex',
+      'POST',
+      commitImgParams,
+      commitImgContent,
+    );
+    // 提交图片上传
+    const commitImg = await request(
+      'POST',
+      'https://imagex.bytedanceapi.com/?' + httpBuildQuery(commitImgParams),
+      refreshToken,
+      {
+        params: {},
+        data: commitImgContent,
+        headers: {
+          ...commitImgHead,
+          'Content-Type': 'application/json',
+        },
+      }
+    );
+
+    if (commitImg['Response ']?.hasOwnProperty('Error')) {
+      console.log(commitImg['Response  ']['Error']['Message']);
+      return;
+    }
+    return commitImg.Result.Results[0].Uri
+  } catch (error) {
+    console.error('上传文件失败:', error);
+  }
 }
 
 /**
@@ -287,4 +404,241 @@ export async function getTokenLiveStatus(refreshToken: string) {
   } catch (err) {
     return false;
   }
+}
+
+export async function getUploadAuth(refreshToken: string): Promise<any> {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const authRes = await request(
+        'POST',
+        '/mweb/v1/get_upload_token?aid=513695&da_version=3.2.6&aigc_features=app_lip_sync',
+        refreshToken,
+        {
+          params: {},
+          data: { scene: 2 }
+        }
+      );
+      if (
+        !authRes
+      ) {
+        reject(authRes.errmsg ?? '获取上传凭证失败,账号可能已掉线!');
+        return;
+      }
+      resolve(authRes);
+    } catch (err) {
+      console.error('获取上传凭证失败:', err);
+      reject(err);
+    }
+  });
+}
+
+export function addHeaders(
+  amzDate: string,
+  sessionToken: string,
+  requestBody: any,
+): any {
+  const headers = {
+    'X-Amz-Date': amzDate,
+    'X-Amz-Security-Token': sessionToken,
+  };
+  if (Object.keys(requestBody).length > 0) {
+    // @ts-ignore
+    headers['X-Amz-Content-Sha256'] = crypto
+      .createHash('sha256')
+      .update(JSON.stringify(requestBody))
+      .digest('hex');
+  }
+  return headers;
+}
+
+export async function generateAuthorizationAndHeader(
+  accessKeyID: string,
+  secretAccessKey: string,
+  sessionToken: string,
+  region: string,
+  service: string,
+  requestMethod: string,
+  requestParams: any,
+  requestBody: any = {},
+): Promise<any> {
+  return new Promise((resolve) => {
+    // 获取当前ISO时间
+    const now = new Date();
+    const amzDate = now.toISOString().replace(/[:\-]|\.\d{3}/g, '').slice(0, 15) + 'Z';
+
+    // 生成请求的Header
+    const requestHeaders: Record<string, string> = addHeaders(
+      amzDate,
+      sessionToken,
+      requestBody,
+    )
+
+    if (Object.keys(requestBody).length > 0) {
+      // @ts-ignore
+      requestHeaders['X-Amz-Content-Sha256'] = crypto
+        .createHash('sha256')
+        .update(JSON.stringify(requestBody))
+        .digest('hex')
+    }
+    // 生成请求的Authorization
+    const authorizationParams = [
+      'AWS4-HMAC-SHA256 Credential=' + accessKeyID + '/' +
+      credentialString(amzDate, region, service),
+      'SignedHeaders=' + signedHeaders(requestHeaders),
+      'Signature=' + signature(
+        secretAccessKey,
+        amzDate,
+        region,
+        service,
+        requestMethod,
+        requestParams,
+        requestHeaders,
+        requestBody,
+      ),
+    ];
+    const authorization = authorizationParams.join(', ');
+
+    // 返回Headers
+    const headers: any = {};
+    for (const key in requestHeaders) {
+      headers[key] = requestHeaders[key];
+    }
+    headers['Authorization'] = authorization;
+    resolve(headers);
+  });
+}
+
+export function credentialString(
+  amzDate: string,
+  region: string,
+  service: string,
+): string {
+  const credentialArr = [
+    amzDate.substring(0, 8),
+    region,
+    service,
+    'aws4_request',
+  ];
+  return credentialArr.join('/');
+}
+
+export function httpBuildQuery(params: any): string {
+  const searchParams = new URLSearchParams();
+  for (const key in params) {
+    if (params?.hasOwnProperty(key)) {
+      searchParams.append(key, params[key]);
+    }
+  }
+  return searchParams.toString();
+}
+
+export function signedHeaders(requestHeaders: any): string {
+  const headers: string[] = [];
+  Object.keys(requestHeaders).forEach(function (r) {
+    r = r.toLowerCase();
+    headers.push(r);
+  });
+  return headers.sort().join(';');
+}
+
+export function canonicalString(
+  requestMethod: string,
+  requestParams: any,
+  requestHeaders: any,
+  requestBody: any,
+): string {
+  let canonicalHeaders: string[] = [];
+  const headerKeys = Object.keys(requestHeaders).sort();
+  for (let i = 0; i < headerKeys.length; i++) {
+    canonicalHeaders.push(
+      headerKeys[i].toLowerCase() + ':' + requestHeaders[headerKeys[i]],
+    );
+  }
+  // @ts-ignore
+  canonicalHeaders = canonicalHeaders.join('\n') + '\n';
+  let body = '';
+  if (Object.keys(requestBody).length > 0) {
+    body = JSON.stringify(requestBody);
+  }
+
+  const canonicalStringArr = [
+    requestMethod.toUpperCase(),
+    '/',
+    httpBuildQuery(requestParams),
+    canonicalHeaders,
+    signedHeaders(requestHeaders),
+    crypto.createHash('sha256').update(body).digest('hex'),
+  ];
+  return canonicalStringArr.join('\n');
+}
+
+export function signature(
+  secretAccessKey: string,
+  amzDate: string,
+  region: string,
+  service: string,
+  requestMethod: string,
+  requestParams: any,
+  requestHeaders: any,
+  requestBody: any,
+): string {
+  // 生成signingKey
+  const amzDay = amzDate.substring(0, 8);
+  const kDate = crypto
+    .createHmac('sha256', 'AWS4' + secretAccessKey)
+    .update(amzDay)
+    .digest();
+  const kRegion = crypto.createHmac('sha256', new Uint8Array(kDate)).update(region).digest();
+  const kService = crypto
+    .createHmac('sha256', new Uint8Array(kRegion))
+    .update(service)
+    .digest();
+  const signingKey = crypto
+    .createHmac('sha256', new Uint8Array(kService))
+    .update('aws4_request')
+    .digest();
+
+  // 生成StringToSign
+  const stringToSignArr = [
+    'AWS4-HMAC-SHA256',
+    amzDate,
+    credentialString(amzDate, region, service),
+    crypto
+      .createHash('sha256')
+      .update(
+        canonicalString(
+          requestMethod,
+          requestParams,
+          requestHeaders,
+          requestBody,
+        ),
+      )
+      .digest('hex'),
+  ];
+  const stringToSign = stringToSignArr.join('\n');
+  return crypto
+    .createHmac('sha256', new Uint8Array(signingKey))
+    .update(stringToSign)
+    .digest('hex');
+}
+
+export async function uploadFile(
+  url: string,
+  fileContent: Buffer,
+  headers: any,
+  refreshToken: string,
+): Promise<any> {
+  return new Promise(async (resolve, reject) => {
+    const res = await request(
+      'POST',
+      url,
+      refreshToken,
+      {
+        params: {},
+        data: fileContent,
+        headers
+      }
+    );
+    resolve(res);
+  });
 }

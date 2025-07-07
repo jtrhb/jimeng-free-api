@@ -3,7 +3,7 @@ import _ from "lodash";
 import APIException from "@/lib/exceptions/APIException.ts";
 import EX from "@/api/consts/exceptions.ts";
 import util from "@/lib/util.ts";
-import { getCredit, receiveCredit, request } from "./core.ts";
+import { getCredit, receiveCredit, request, uploadImage } from "./core.ts";
 import logger from "@/lib/logger.ts";
 
 const DEFAULT_ASSISTANT_ID = "513695";
@@ -36,7 +36,8 @@ export async function generateImages(
     sampleStrength?: number;
     negativePrompt?: string;
   },
-  refreshToken: string
+  refreshToken: string,
+  image?: string
 ) {
   const model = getModel(_model);
   logger.info(`使用模型: ${_model} 映射模型: ${model} ${width}x${height} 精细度: ${sampleStrength}`);
@@ -45,6 +46,105 @@ export async function generateImages(
   if (totalCredit <= 0)
     await receiveCredit(refreshToken);
 
+  let uploadID = null
+  if (image) {
+    uploadID = await uploadImage(image, refreshToken);
+  }
+
+  let abilities: Record<string, any> = {}
+  if (image) {
+    abilities = {
+      "blend": {
+        "type": "",
+        "id": util.uuid(),
+        "min_features": [],
+        "core_param": {
+          "type": "",
+          "id": util.uuid(),
+          "model": model,
+          "prompt": '##' + prompt,
+          "sample_strength": sampleStrength || 0.5,
+          "image_ratio": 1,
+          "large_image_info": {
+            "type": "",
+            "id": util.uuid(),
+            "height": 1360,
+            "width": 1360,
+            "resolution_type": '1k'
+          }
+        },
+        "ability_list": [
+          {
+            "type": "",
+            "id": util.uuid(),
+            "name": "byte_edit",
+            "image_uri_list": [
+              uploadID
+            ],
+            "image_list": [
+              {
+                "type": "image",
+                "id": util.uuid(),
+                "source_from": "upload",
+                "platform_type": 1,
+                "name": "",
+                "image_uri": uploadID,
+                "width": 0,
+                "height": 0,
+                "format": "",
+                "uri": uploadID
+              }
+            ],
+            "strength": 0.5
+          }
+        ],
+        "history_option": {
+          "type": "",
+          "id": util.uuid(),
+        },
+        "prompt_placeholder_info_list": [
+          {
+            "type": "",
+            "id": util.uuid(),
+            "ability_index": 0
+          }
+        ],
+        "postedit_param": {
+          "type": "",
+          "id": util.uuid(),
+          "generate_type": 0
+        }
+      }
+    }
+  } else {
+    abilities = {
+      "generate": {
+        "type": "",
+        "id": util.uuid(),
+        "core_param": {
+          "type": "",
+          "id": util.uuid(),
+          "model": model,
+          "prompt": prompt,
+          "negative_prompt": negativePrompt || "",
+          "seed": Math.floor(Math.random() * 100000000) + 2500000000,
+          "sample_strength": sampleStrength || 0.5,
+          "image_ratio": 1,
+          "large_image_info": {
+            "type": "",
+            "id": util.uuid(),
+            "height": height || 1024,
+            "width": width || 1024,
+            "resolution_type": '1k'
+          }
+        },
+        "history_option": {
+          "type": "",
+          "id": util.uuid(),
+        }
+      }
+    }
+  }
   const componentId = util.uuid();
   const { aigc_data } = await request(
     "post",
@@ -55,9 +155,9 @@ export async function generateImages(
         babi_param: encodeURIComponent(
           JSON.stringify({
             scenario: "image_video_generation",
-            feature_key: "aigc_to_image",
+            feature_key: image ? "to_image_referenceimage_generate" : "aigc_to_image",
             feature_entrance: "to_image",
-            feature_entrance_detail: "to_image-" + model,
+            feature_entrance_detail: image ? "to_image-referenceimage-byte_edit" : "to_image-" + model,
           })
         ),
       },
@@ -67,7 +167,7 @@ export async function generateImages(
           template_id: "",
         },
         submit_id: util.uuid(),
-        metrics_extra: JSON.stringify({
+        metrics_extra: image ? undefined : JSON.stringify({
           templateId: "",
           generateCount: 1,
           promptSource: "custom",
@@ -87,36 +187,9 @@ export async function generateImages(
               type: "image_base_component",
               id: componentId,
               min_version: DRAFT_VERSION,
-              generate_type: "generate",
+              generate_type: image ? "blend" : "generate",
               aigc_mode: "workbench",
-              abilities: {
-                type: "",
-                id: util.uuid(),
-                generate: {
-                  type: "",
-                  id: util.uuid(),
-                  core_param: {
-                    type: "",
-                    id: util.uuid(),
-                    model,
-                    prompt,
-                    negative_prompt: negativePrompt,
-                    seed: Math.floor(Math.random() * 100000000) + 2500000000,
-                    sample_strength: sampleStrength,
-                    image_ratio: 1,
-                    large_image_info: {
-                      type: "",
-                      id: util.uuid(),
-                      height,
-                      width,
-                    },
-                  },
-                  history_option: {
-                    type: "",
-                    id: util.uuid(),
-                  },
-                },
-              },
+              abilities,
             },
           ],
         }),

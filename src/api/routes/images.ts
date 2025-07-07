@@ -2,7 +2,7 @@ import _ from "lodash";
 
 import Request from "@/lib/request/Request.ts";
 import { generateImages } from "@/api/controllers/images.ts";
-import { tokenSplit } from "@/api/controllers/core.ts";
+import { tokenSplit, uploadImage } from "@/api/controllers/core.ts";
 import util from "@/lib/util.ts";
 
 export default {
@@ -31,6 +31,7 @@ export default {
         height,
         sample_strength: sampleStrength,
         response_format,
+        image
       } = request.body;
       const responseFormat = _.defaultTo(response_format, "url");
       const imageUrls = await generateImages(model, prompt, {
@@ -38,7 +39,7 @@ export default {
         height,
         sampleStrength,
         negativePrompt,
-      }, token);
+      }, token, image);
       let data = [];
       if (responseFormat == "b64_json") {
         data = (
@@ -54,5 +55,12 @@ export default {
         data,
       };
     },
+    "/upload": async (request: Request) => {
+      const tokens = tokenSplit(request.headers.authorization);
+      const token = _.sample(tokens);
+      const { image } = request.body;
+      const uploadId = await uploadImage(image, token);
+      return { uploadId }
+    }
   },
 };
