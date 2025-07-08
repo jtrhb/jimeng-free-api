@@ -68,8 +68,8 @@ export async function generateImages(
           "large_image_info": {
             "type": "",
             "id": util.uuid(),
-            "height": 1360,
-            "width": 1360,
+            "height": height,
+            "width": width,
             "resolution_type": '1k'
           }
         },
@@ -209,8 +209,8 @@ export async function generateImages(
       data: {
         history_ids: [historyId],
         image_info: {
-          width: 2048,
-          height: 2048,
+          width: width,
+          height: height,
           format: "webp",
           image_scene_list: [
             {
